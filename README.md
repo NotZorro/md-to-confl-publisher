@@ -1,213 +1,158 @@
-# Md → Confluence Publisher (Data Center)
 
-Это **только** публикатор. Без ваших доков. Без локальной Confluence. Без `.idea`.  
-Потому что “всё в одном архиве” удобно только если вы коллекционируете боль.
+# md-to-conf-publisher
+
+Публикатор Markdown-документации в Confluence.  
+Текущая версия поддерживает **инкрементальную публикацию**: в CI/CD можно обновлять **только изменённые/новые файлы из MR** (без пересборки всей репы), включая **rename** без создания дублей страниц.
+
+---
 
 ## Что делает
 
-- Берёт дерево `docs/**/*.md` в репе с документацией.
-- Для каждой папки создаёт “страницу-раздел”.
-- Для каждого `.md` создаёт/обновляет страницу Confluence.
-- Переписывает markdown-ссылки между файлами в ссылки между Confluence-страницами.
-- (Опционально) добавляет TOC и нумерует заголовки.
+- Создаёт/обновляет страницы Confluence из `docs/**/*.md`
+- Поддерживает 2 прохода:
+  - **pass 1**: создаёт/обновляет страницы, выставляет заголовки/родителей, сохраняет метаданные источника
+  - **pass 2**: переписывает относительные ссылки в опубликованных страницах на корректные Confluence-ссылки
+- Ведёт устойчивое соответствие `md-файл -> pageId` через content property:
+  - `md2conf_source.key = file:<path>` (например `file:docs/product offering/ADR/ADR-0001.md`)
 
-
-## Как публикатор узнаёт "свои" страницы
-
-- Ставит странице **один** видимый label (по умолчанию `managed-docs`).
-  Его можно переопределить в `publish.yml`, чтобы разные команды могли шарить один space/root, но не наступать друг другу на горло:
-
-  ```yml
-  options:
-    managed_label: team-a-docs
-  ```
-- Источник страницы (ключ файла/директории и его хэш), а также **технические классификаторы** (md/dir/section) хранит в **content properties** Confluence (`md2conf_source`). Это обычным пользователям в UI не видно.
-- Старый режим (label вида `src-xxxxxxxxxxxx`, а также `md`/`dir`/`section`) автоматически мигрируется: при первом прогоне такие labels удаляются, если у страницы уже есть content property с source key.
+---
 
 ## Требования
 
-- Confluence **Data Center** с включённым REST API
-- Токен/логин, который может создавать/обновлять страницы в нужном Space
-- Либо Python 3.12+, либо Docker
+- Python 3.11+ (если запускать без контейнера)
+- Доступ к Confluence (URL + токен/учётка) с правами на создание/редактирование страниц в целевом Space
+- Репозиторий с документацией в `docs/`
 
 ---
 
-## Быстрый старт: локально (без Docker)
+## Настройка
 
-1) Склонируй **репу с доками** (docs-repo) и положи туда `publish.yml` (пример в `examples/publish.example.yml`).
+### 1) Переменные окружения
 
-2) В этой (publisher) репе:
+Минимально необходимые (названия могут отличаться в твоём `publish.yml`, смотри раздел ниже):
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
+- `CONF_BASE_URL` — базовый URL Confluence (например `http://localhost:8090`)
+- `CONF_SPACE_KEY` — ключ space (например `DOC`)
+- `CONF_AUTH_*` — токен/логин-пароль (как у тебя принято)
+- при необходимости: `CONF_PARENT_PAGE_ID` (если корневую страницу задаёшь явно)
 
-3) Запуск из **корня docs-repo**:
+Рекомендуется хранить в `.env` и передавать в контейнер `--env-file .env`.
 
-```powershell
-$env:CONF_TOKEN="..."
-$env:CONF_BASE_URL="http://localhost:8090"
-$env:CONF_SPACE="DOC"
-$env:CONF_DOCS_ROOT_ID="884737"
+### 2) Конфиг `publish.yml`
 
-python C:\path\to\md-to-conf-publisher\publish_docs.py --pass 2 --cfg publish.yml
-```
+В `publish.yml` задаются:
+- корневая директория с доками (`docs/`)
+- правила маппинга “папка -> раздел”
+- шаблоны заголовков/родителей
+- настройки Confluence клиента
 
 ---
 
-## Быстрый старт: локально (Docker, максимально похоже на CI)
+## Запуск
 
-### 1) Собери образ
+### Локально (Python)
 
-```powershell
-cd C:\path\to\md-to-conf-publisher
-docker build -t publisher-to-conf:dev .
-```
+```bash
+python publish_docs.py --pass 2 --cfg publish.yml
+````
 
-### 2) Подготовь `.env` в **docs-repo**
+### Через Docker
 
-Скопируй `examples/env.example` в docs-repo как `.env` и заполни.
-
-ВАЖНО: если Confluence запущена на хосте, в контейнере **нельзя** использовать `localhost`.
-Используй `http://host.docker.internal:8090`.
-
-### 3) Запусти
-
-```powershell
-cd C:\path\to\docs-repo
-
-docker run --rm --env-file .\.env `
-  -v "${PWD}:/work" -w /work `
-  publisher-to-conf:dev `
+```bash
+docker run --rm --env-file .env \
+  -v "$PWD:/work" -w /work \
+  md-to-conf-publisher:dev \
   --pass 2 --cfg publish.yml
 ```
 
-Проверка, что контейнер видит Confluence:
-
-```powershell
-docker run --rm curlimages/curl:8.5.0 -sS -o /dev/null -w "HTTP=%{http_code}`n" http://host.docker.internal:8090/
-```
-
-`HTTP=302` или `HTTP=200` — всё норм.
+> Обычно в CI запускают `--pass 2`, потому что он включает логику публикации + обновление ссылок.
 
 ---
 
-## Как устроены проходы
+## Инкрементальная публикация (для MR / changed-only)
 
-- `--pass 1`: создаёт/обновляет страницы без переписывания ссылок
-- `--pass 2`: делает **двухфазно внутри одного запуска**:
-  - Phase A: ensure всех страниц и заполнение карты `path → pageId`
-  - Phase B: переписывание ссылок и финальный update body  
-  Поэтому второй запуск `--pass 2` больше не нужен.
+Чтобы не публиковать всю репу, публикатор умеет принимать список изменённых файлов.
+
+### Формат `changed.txt`
+
+Поддерживаются строки:
+
+* Просто путь (трактуется как `M`):
+
+  * `docs/path/to/file.md`
+
+* Явные статусы:
+
+  * `A docs/path/to/new.md`
+  * `M docs/path/to/changed.md`
+  * `D docs/path/to/deleted.md` (сейчас игнорируется, удаление страниц не делаем)
+
+* Rename:
+
+  * `R docs/old.md docs/new.md`
+  * `R100 docs/old.md docs/new.md` (git diff иногда так пишет)
+
+### Запуск changed-only
+
+```bash
+python publish_docs.py --pass 2 --cfg publish.yml --paths-file changed.txt
+```
+
+Поведение:
+
+* `A/M` → создаёт/обновляет соответствующие страницы
+* `R/Rxxx` → обновляет **существующую страницу старого файла** и перепривязывает её к новому пути (обновляет `md2conf_source.key`), чтобы не плодить дубли
+* `D` → игнорируется
 
 ---
 
-## Конфиг `publish.yml`
+## Пример генерации changed.txt в GitLab CI
 
-Публикатор читает конфиг из docs-repo. Пример: `examples/publish.example.yml`.
+```bash
+BASE_SHA="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+HEAD_SHA="$CI_COMMIT_SHA"
 
-### Приоритет настроек
-Если значения заданы и в `publish.yml`, и в env (`CONF_BASE_URL`, `CONF_SPACE`, `CONF_DOCS_ROOT_ID`) — **env побеждает**.
-
----
-
-## Нумерация заголовков
-
-Если вы не хотите включать нумерацию в Confluence (плагины/макросы), можно включить нумерацию прямо в тексте:
-
-```yml
-options:
-  heading_numbering: true
-  heading_numbering_max_level: 3
+git diff --name-status "$BASE_SHA" "$HEAD_SHA" -- docs \
+  | awk '
+      $1=="M" || $1=="A" {print $1" "$2}
+      $1 ~ /^R/ {print $1" "$2" "$3}
+      $1=="D" {print $1" "$2}
+    ' \
+  | grep -E '\.md($| )' \
+  > changed.txt
 ```
 
-Публикатор:
-- убирает ручную нумерацию из `.md` вида `1.`, `1.1`, `1)`
-- добавляет свою (1., 1.1., 1.1.1.) до указанного уровня
+Дальше запуск контейнера:
 
-Замечание, чтобы не было сюрпризов:
-- если нумерация добавляется в текст заголовка, она будет видна и в TOC (это одна строка текста).
-- если нужен TOC без цифр, тогда придётся либо жить без нумерации в тексте, либо использовать Confluence-плагин для нумерации.
-
----
-
-## Команды
-
-Публикация всего дерева:
-```powershell
-python .\publish_docs.py --pass 2 --cfg publish.yml
-```
-
-Публикация **только изменившихся страниц** (MR mode):
-
-1) В CI (или локально) сформируй `changed.txt`.
-
-Формат на строку:
-- `<path>` (трактуется как M)
-- `A <path>` / `M <path>` / `D <path>`
-- `R <old> <new>` или `R100 <old> <new>` (rename)
-
-2) Запусти публикатор:
-
-```powershell
-python .\publish_docs.py --pass 2 --cfg publish.yml --paths-file changed.txt
-```
-
-Замечания:
-- `D` пока игнорируется (страницы не удаляем).
-- Для `R` (rename) публикатор обновит **ту же** Confluence-страницу и перепишет source-key, чтобы не плодить дубли.
-
-Публикация одного файла:
-```powershell
-python .\publish_one.py docs\strategy\playbook\Playbook-0001.md --pass 2 --cfg publish.yml
-```
-
-Удалить только то, что создавал публикатор (по label из `options.managed_label`, по умолчанию `managed-docs`) под корнем docs_root:
-```powershell
-python .\cleanup_managed.py --list-only --cfg publish.yml
-python .\cleanup_managed.py --delete --cfg publish.yml
+```bash
+docker run --rm --env-file .env \
+  -v "$PWD:/work" -w /work \
+  md-to-conf-publisher:dev \
+  --pass 2 --cfg publish.yml --paths-file changed.txt
 ```
 
 ---
 
-## Тесты
+## Важные заметки
 
-Тесты нужны, чтобы публикатор не ломался из-за мелких правок.
+* `_index.md` и `README.md` внутри `docs/` обычно используются как “разделы/индексы” и могут обрабатываться отдельно правилами конфига.
+* Для корректного pass2 (переписывание ссылок) публикатор подтягивает маппинги уже опубликованных страниц из Confluence через property `md2conf_source.key`. Поэтому ссылки резолвятся, даже если в MR публикуется только часть файлов.
 
-Установка зависимостей для разработки:
-
-```powershell
-pip install -r requirements.txt -r requirements-dev.txt
-```
-
-Запуск:
-
-```powershell
-pytest
-```
-
+---
 
 ## Troubleshooting
 
-### Docker: Confluence runs on host, but container cannot reach `http://localhost:8090`
-Inside a container, `localhost` is the container itself. Use:
+* **Ссылки не резолвятся в pass2**
 
-- `CONF_BASE_URL=http://host.docker.internal:8090` (Docker Desktop)
+  * проверь, что у опубликованных страниц есть property `md2conf_source.key = file:...`
+  * убедись, что `--pass 2` запускается после (или вместе с) pass1 логикой публикации
 
-Quick check:
+* **После rename появился дубль**
 
-```powershell
-docker run --rm curlimages/curl:8.5.0 -sS -o /dev/null -w "HTTP=%{http_code}`n" http://host.docker.internal:8090/
-```
+  * проверь, что в `changed.txt` попало событие `R ... ...`, а не только новый путь как `A`
+  * если git diff не даёт rename, включи его детект (например, `git diff -M`)
 
-### Heading numbering in text
-If `options.heading_numbering=true`, numbers are inserted into heading *text* (H1-H3 by default). That means the TOC macro will also show these numbers, because it reads the heading text.
+* **403/401 от Confluence**
 
-### Про host.docker.internal в ссылках
-Если вы запускаете публикатор в Docker и Confluence крутится на хосте, вы будете использовать
-`CONF_BASE_URL=http://host.docker.internal:8090` для доступа к REST API.
+  * проверь токен/права на space и родительские страницы
 
-Это **не попадёт** в опубликованный контент: ссылки между страницами генерируются как **относительные**
-`/pages/viewpage.action?pageId=...` (с учётом возможного context path вроде `/wiki`).
