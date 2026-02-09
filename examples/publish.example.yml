@@ -1,0 +1,46 @@
+# publish.example.yml — пример конфига, который лежит в репе с ДОКАМИ
+# Публикатор читает его из рабочей директории (workdir) — то есть из docs-repo.
+
+# ВАЖНО:
+# - base_url/space/docs_root_id можно задавать тут, а можно (и обычно лучше) через env переменные в CI.
+# - Если и в конфиге, и в env заданы значения — env ИМЕЕТ ПРИОРИТЕТ.
+
+# base_url: http://host.docker.internal:8090
+# space: DOC
+# docs_root_id: "884737"
+
+docs_dir: docs
+
+# Человеческие названия доменов (папки 1-го уровня внутри docs/)
+domain_title_map:
+  product offering: Product offering
+  shopping-cart: Shopping cart
+  strategy: Strategy
+
+# Человеческие названия разделов (папки 2-го уровня)
+section_title_map:
+  ADR: ADR
+  features: Features
+  playbook: Playbook
+  algorithms: Algorithms
+  service_specifications: Service specifications
+
+options:
+  # Единственный видимый label, который ставится всем страницам, которыми управляет публикатор.
+  # Можно переопределить, если публикатор используют разные команды в одном space/root.
+  managed_label: managed-docs
+
+  toc: true
+  toc_min: 1
+  toc_max: 3
+  toc_style: none
+  toc_outline: false
+
+  # Миграция/гигиена: удалять старые видимые тех-лейблы (src-*, md/dir/section)
+  migrate_legacy_src_labels: true
+  migrate_legacy_doc_labels: true
+
+  # Нумерация заголовков В ТЕКСТЕ (без плагинов Confluence), до 3 уровня.
+  # Если включено — цифры будут видны и в TOC, потому что это часть заголовка.
+  heading_numbering: true
+  heading_numbering_max_level: 3

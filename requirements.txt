@@ -1,0 +1,5 @@
+requests>=2.31.0
+PyYAML>=6.0.1
+markdown-it-py>=3.0.0
+mdit-py-plugins>=0.4.0
+beautifulsoup4>=4.12.2
