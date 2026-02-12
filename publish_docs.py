@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import hashlib
 import os
@@ -6,6 +8,9 @@ import posixpath
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse, unquote
+from pathlib import Path
+from typing import Optional, List
+import shlex
 
 import yaml
 
@@ -144,70 +149,116 @@ class Change:
     new_path: str | None = None
 
 
-def _parse_paths_file(paths_file: Path, docs_dir: Path) -> list[Change]:
-    """Parse a file with changed paths.
+def _is_under_docs(p: str, docs_dir: Path) -> bool:
+    docs = _norm_posix(docs_dir.as_posix()).rstrip("/")
+    return p == docs or p.startswith(docs + "/")
 
-    Supported formats (one per line):
-      - Plain path (treated as "M"):
-          docs/domain/section/file.md
-      - "A <path>" / "M <path>" / "D <path>"
-      - Git name-status rename ("R", "R100", ...):
-          R docs/old.md docs/new.md
-          R100 docs/old.md docs/new.md
 
-    Anything outside docs_dir is ignored.
+def _parse_paths_file(paths_file: Path, docs_dir: Path) -> List[Change]:
     """
-    out: list[Change] = []
-    for raw in paths_file.read_text(encoding="utf-8").splitlines():
+    Reads changed paths list and returns structured changes.
+
+    Supported lines:
+      1) Plain path (treated as "M"), may contain spaces:
+         docs/product offering/features/Feature-0001.md
+
+      2) Status + path (path may contain spaces):
+         M docs/product offering/features/Feature-0001.md
+         A docs/new.md
+         D docs/old.md
+
+      3) Git name-status TAB-delimited (recommended; safe for spaces):
+         M<TAB>docs/.../file.md
+         R100<TAB>docs/old name.md<TAB>docs/new name.md
+
+      4) Rename non-tab requires quotes if spaces:
+         R "docs/old name.md" "docs/new name.md"
+
+    Notes:
+      - Non-tab rename WITHOUT quotes and WITH spaces is ambiguous and will be skipped.
+      - Paths outside docs_dir are ignored.
+      - Non-.md paths are ignored.
+    """
+    changes: List[Change] = []
+
+    # utf-8-sig strips BOM if someone saved the file "creatively"
+    text = paths_file.read_text(encoding="utf-8-sig")
+
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
 
-        parts = line.split()
+        # --- 1) TAB-delimited (best for CI; matches git diff --name-status output)
+        if "\t" in line:
+            parts = [p for p in line.split("\t") if p != ""]
+            if not parts:
+                continue
+            op = parts[0].strip()
 
-        # 1) plain path
-        if len(parts) == 1 and (parts[0].endswith(".md") or ".md" in parts[0]):
-            p = _norm_posix(parts[0])
-            out.append(Change("M", p))
+            if op.startswith("R"):
+                # Rxxx <old> <new>
+                if len(parts) < 3:
+                    continue
+                old_p = _norm_posix(parts[1])
+                new_p = _norm_posix(parts[2])
+                if not (old_p.endswith(".md") and new_p.endswith(".md")):
+                    continue
+                if not (_is_under_docs(old_p, docs_dir) or _is_under_docs(new_p, docs_dir)):
+                    continue
+                changes.append(Change("R", old_p, new_p))
+                continue
+
+            if op in ("A", "M", "D"):
+                if len(parts) < 2:
+                    continue
+                p = _norm_posix(parts[1])
+                if not p.endswith(".md"):
+                    continue
+                if not _is_under_docs(p, docs_dir):
+                    continue
+                changes.append(Change(op, p))
+                continue
+
+            # unknown op in tabbed format: ignore
             continue
 
-        # 2) status-prefixed
-        op = parts[0]
-        if op.startswith("R") and len(parts) >= 3:
-            old_p = _norm_posix(parts[1])
-            new_p = _norm_posix(parts[2])
-            out.append(Change("R", old_p, new_p))
+        # --- 2) Status + "rest of line path" (supports spaces)
+        m = re.match(r"^(A|M|D)\s+(.+)$", line)
+        if m:
+            op = m.group(1)
+            p = _norm_posix(m.group(2))
+            if p.endswith(".md") and _is_under_docs(p, docs_dir):
+                changes.append(Change(op, p))
             continue
 
-        if op in ("A", "M", "D") and len(parts) >= 2:
-            p = _norm_posix(parts[1])
-            out.append(Change(op, p))
+        # --- 3) Rename without tabs: must be quotable
+        if line.startswith("R"):
+            try:
+                parts = shlex.split(line)
+            except ValueError:
+                parts = line.split()
+
+            if not parts:
+                continue
+
+            op = parts[0]
+            if op.startswith("R") and len(parts) >= 3:
+                old_p = _norm_posix(parts[1])
+                new_p = _norm_posix(parts[2])
+                if old_p.endswith(".md") and new_p.endswith(".md"):
+                    if _is_under_docs(old_p, docs_dir) or _is_under_docs(new_p, docs_dir):
+                        changes.append(Change("R", old_p, new_p))
+            # если без кавычек и со спейсами, оно всё равно развалится и сюда не попадёт корректно
             continue
 
-        # ignore unknown lines
-
-    # Normalize to paths under docs_dir (as stored in the repo).
-    docs_root = _norm_posix(str(docs_dir))
-    filtered: list[Change] = []
-    for ch in out:
-        def is_under_docs(p: str) -> bool:
-            p = _norm_posix(p)
-            # Accept both "docs/..." and "<docs_dir>/..."
-            if p == docs_root or p.startswith(docs_root + "/"):
-                return True
-            if docs_dir.name == "docs" and p.startswith("docs/"):
-                return True
-            return False
-
-        if ch.op == "R":
-            if ch.new_path and is_under_docs(ch.new_path) and is_under_docs(ch.path):
-                filtered.append(ch)
+        # --- 4) Plain path (whole line is path; supports spaces)
+        p = _norm_posix(line)
+        if p.endswith(".md") and _is_under_docs(p, docs_dir):
+            changes.append(Change("M", p))
             continue
-        if is_under_docs(ch.path):
-            filtered.append(ch)
 
-    return filtered
-
+    return changes
 
 def load_cfg(path: str) -> Cfg:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
